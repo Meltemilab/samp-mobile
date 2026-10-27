@@ -1,0 +1,149 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 7e734cd..a6991d3 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -26,7 +26,7 @@
+     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" tools:ignore="ProtectedPermissions" />
+ 
+     <application
+-        android:label="Winlator Ludashi"
++        android:label="SA-MP Mobile"
+         android:icon="@mipmap/ic_launcher"
+         android:roundIcon="@mipmap/ic_launcher_round"
+         android:theme="@style/AppTheme"
+@@ -58,11 +58,13 @@
+             android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|density|navigation"
+             android:exported="false" />
+ 
++        <!-- SA-MP Mobile: the SA-MP launcher is the home screen; Winlator Ludashi's UI is "Advanced settings" -->
+         <activity
+-            android:name="com.winlator.cmod.MainActivity"
+-            android:theme="@style/AppTheme.Dark"
++            android:name="com.winlator.cmod.samp.SampLauncherActivity"
++            android:theme="@style/AppTheme"
+             android:screenOrientation="sensor"
+             android:exported="true"
++            android:windowSoftInputMode="adjustResize"
+             android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|density|navigation">
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN"/>
+@@ -70,6 +72,13 @@
+             </intent-filter>
+         </activity>
+ 
++        <activity
++            android:name="com.winlator.cmod.MainActivity"
++            android:theme="@style/AppTheme.Dark"
++            android:screenOrientation="sensor"
++            android:exported="true"
++            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|density|navigation" />
++
+         <activity android:name="com.winlator.cmod.BigPictureActivity" android:theme="@style/Theme.AppCompat" android:exported="false" />
+ 
+         <activity
+diff --git a/app/src/main/java/com/winlator/cmod/XServerDisplayActivity.java b/app/src/main/java/com/winlator/cmod/XServerDisplayActivity.java
+index ec04d53..cdfbb64 100644
+--- a/app/src/main/java/com/winlator/cmod/XServerDisplayActivity.java
++++ b/app/src/main/java/com/winlator/cmod/XServerDisplayActivity.java
+@@ -298,6 +298,7 @@ public class XServerDisplayActivity extends AppCompatActivity {
+     @Override
+     public void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
++        com.winlator.cmod.samp.CrashLog.install(this);
+         AppUtils.hideSystemUI(this);
+         AppUtils.keepScreenOn(this);
+ 
+@@ -482,6 +483,14 @@ public class XServerDisplayActivity extends AppCompatActivity {
+             ProcessHelper.addDebugCallback(winlatorLogcatLogger);
+         }
+ 
++        /* SA-MP mode: everything Wine prints goes into the launch's crash log */
++        if (shortcut != null && shortcut.getExtra("sampMode").equals("1") && !shortcut.getExtra("sampLog").isEmpty()) {
++            sampSession = new com.winlator.cmod.samp.CrashLog.Session(this, new File(shortcut.getExtra("sampLog")));
++            ProcessHelper.addDebugCallback(sampSession);
++            String sampGta = shortcut.getExtra("sampGta");
++            sampSession.setGameDirs(sampGta.isEmpty() ? null : new File(sampGta), container.getRootDir());
++        }
++
+         graphicsDriver = container.getGraphicsDriver();
+         String graphicsDriverConfig = container.getGraphicsDriverConfig();
+         audioDriver = Container.normalizeAudioDriver(container.getAudioDriver());
+@@ -604,6 +613,9 @@ public class XServerDisplayActivity extends AppCompatActivity {
+             @Override
+             public void onMapWindow(Window window) {
+                 assignTaskAffinity(window);
++                if (sampSession != null && (window.isApplicationWindow() || !window.getName().isEmpty())) {
++                    sampSession.note("Window mapped: \"" + window.getName() + "\" class=" + window.getClassName() + " " + window.getWidth() + "x" + window.getHeight());
++                }
+             }
+ 
+             @Override
+@@ -889,6 +901,7 @@ public class XServerDisplayActivity extends AppCompatActivity {
+ 
+     private void exit() {
+         if (!exiting.compareAndSet(false, true)) return;
++        if (sampSession != null) sampSession.closedByUser();
+         NotificationManagerCompat.from(this).cancel(NOTIFICATION_ID);
+         boolean removeLoadingBar = PreferenceManager.getDefaultSharedPreferences(this)
+                 .getBoolean("remove_loading_bar_when_booting_games", false);
+@@ -1109,6 +1122,10 @@ public class XServerDisplayActivity extends AppCompatActivity {
+             guestProgramLauncherComponent.setWineInfo(this.wineInfo);
+ 
+             String guestExecutable = "wine explorer /desktop=shell," + xServer.screenInfo + " " + getWineStartCommand();
++            if (sampSession != null) {
++                sampSession.note("Game screen started: graphics=" + graphicsDriver + " (" + container.getGraphicsDriverConfig() + ") dxwrapper=" + dxwrapper + " emulator=" + emulator + " screen=" + xServer.screenInfo + " audio=" + audioDriver);
++                sampSession.note("Command: " + guestExecutable);
++            }
+ 
+             guestProgramLauncherComponent.setGuestExecutable(guestExecutable);
+ 
+@@ -1178,7 +1195,10 @@ public class XServerDisplayActivity extends AppCompatActivity {
+         }
+ 
+         guestProgramLauncherComponent.setEnvVars(envVars);
+-        guestProgramLauncherComponent.setTerminationCallback((status) -> runOnUiThread(this::exit));
++        guestProgramLauncherComponent.setTerminationCallback((status) -> {
++            if (sampSession != null) sampSession.end(status);
++            runOnUiThread(this::exit);
++        });
+ 
+         environment.addComponent(guestProgramLauncherComponent);
+ 
+@@ -1214,6 +1234,28 @@ public class XServerDisplayActivity extends AppCompatActivity {
+         return container != null ? container.getSurfaceFormat() : "rgba8";
+     }
+ 
++    private com.winlator.cmod.samp.CrashLog.Session sampSession;
++
++    /** SA-MP mode: a small always-visible button that opens the phone keyboard (for chat and commands). */
++    private void addSampKeyboardButton(FrameLayout rootView) {
++        float density = getResources().getDisplayMetrics().density;
++        android.widget.TextView button = new android.widget.TextView(this);
++        button.setText("\u2328");
++        button.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 20);
++        button.setTextColor(0xFFFFFFFF);
++        button.setGravity(android.view.Gravity.CENTER);
++        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
++        bg.setColor(0x66000000);
++        bg.setCornerRadius(8 * density);
++        button.setBackground(bg);
++        int size = (int)(40 * density);
++        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(size, size, android.view.Gravity.TOP | android.view.Gravity.END);
++        lp.topMargin = (int)(6 * density);
++        lp.rightMargin = (int)(6 * density);
++        button.setOnClickListener(v -> AppUtils.showKeyboard(this));
++        rootView.addView(button, lp);
++    }
++
+     private void setupUI() {
+         FrameLayout rootView = findViewById(R.id.FLXServerDisplay);
+ 
+@@ -1367,6 +1409,8 @@ public class XServerDisplayActivity extends AppCompatActivity {
+ 
+         AppUtils.observeSoftKeyboardVisibility(drawerLayout, renderer::setScreenOffsetYRelativeToCursor);
+ 
++        if (shortcut != null && shortcut.getExtra("sampMode").equals("1")) addSampKeyboardButton(rootView);
++
+         setupSidebarHudControls();
+         setupSidebarGraphicsControls();
+     }
